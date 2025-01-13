@@ -10,7 +10,7 @@ import io
 import logging
 import os
 import re
-from datetime import timedelta
+from datetime import timedelta, datetime
 from typing import Tuple, Dict, List
 from pathlib import Path
 
@@ -107,6 +107,10 @@ MIN_CONFIDENCE = 0.1
 JPG = "jpg"
 PNG = "png"
 
+# rgb(red, green, blue)
+RED = (255, 0, 0)  # For objects within the ROI
+GREEN = (0, 255, 0)  # For ROI box
+YELLOW = (255, 255, 0)  # Unused
 
 TARGETS_SCHEMA = {
     vol.Required(CONF_TARGET): cv.string,
@@ -314,15 +318,15 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         ]  # can be a name or a type
         self._object_box_colour = tuple(int(object_box_colour.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
         self._roi_box_colour = tuple(int(roi_box_colour.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-        self._filename_prefix = filename_prefix
+        self._filename_prefix = filename_prefix if filename_prefix is not None else ''
 
         self._camera = camera_entity
         self._camera_name = split_entity_id(camera_entity)[1]
         if name:
             self._name = name
         else:
-            # camera_name = split_entity_id(camera_entity)[1]
-            self._name = f"{self._filename_prefix}{self._camera_name}"
+            camera_name = split_entity_id(camera_entity)[1]
+            self._name = f"{self._filename_prefix}{camera_name}{datetime.today().strftime('%Y%m%d%H%M%S')}"
 
         self._state = None
         self._objects = []  # The parsed raw data
@@ -440,7 +444,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             target_event_data[ATTR_ENTITY_ID] = self.entity_id
             if saved_image_path:
                 target_event_data[SAVED_FILE] = saved_image_path
-            self.hass.bus.fire(EVENT_OBJECT_DETECTED, target_event_data)
+            self.hass.bus.async_fire(EVENT_OBJECT_DETECTED, target_event_data)
 
     @property
     def camera_entity(self):
@@ -512,7 +516,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 img.width,
                 img.height,
                 text="ROI",
-                color=self._roi_box_colour,
+                color=GREEN,
             )
 
         for obj in targets:
@@ -530,14 +534,14 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 img.width,
                 img.height,
                 text=box_label,
-                color=self._object_box_colour,
+                color=RED,
             )
 
             # draw bullseye
             draw.text(
                 (centroid["x"] * img.width, centroid["y"] * img.height),
                 text="X",
-                fill=self._object_box_colour,
+                fill=RED,
             )
 
         # Save images, returning the path of saved image as str
