@@ -4,15 +4,16 @@ Component that will perform object detection and identification via CodeProject.
 For more details about this platform, please refer to the documentation at
 https://home-assistant.io/components/image_processing.codeproject_ai_object
 """
-from collections import namedtuple, Counter
-import datetime
+
+from __future__ import annotations
+
+from collections import Counter, namedtuple
+from datetime import datetime
 import io
 import logging
-import os
 import re
-from datetime import timedelta, datetime
-from typing import Tuple, Dict, List
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageDraw, UnidentifiedImageError
 import voluptuous as vol
@@ -21,7 +22,6 @@ import codeprojectai.core as cpai
 
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
-from homeassistant.util.pil import draw_box
 from homeassistant.components.image_processing import (
     ATTR_CONFIDENCE,
     CONF_CONFIDENCE,
@@ -29,17 +29,13 @@ from homeassistant.components.image_processing import (
     CONF_NAME,
     CONF_SOURCE,
     DEFAULT_CONFIDENCE,
-    DOMAIN,
     PLATFORM_SCHEMA,
     ImageProcessingEntity,
 )
-from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    ATTR_NAME,
-    CONF_IP_ADDRESS,
-    CONF_PORT,
-)
-from homeassistant.core import split_entity_id
+from homeassistant.const import ATTR_ENTITY_ID, CONF_IP_ADDRESS, CONF_PORT
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.util.pil import draw_box
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,8 +56,6 @@ OTHER = "other"
 PERSON = "person"
 VEHICLE = "vehicle"
 VEHICLES = ["bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck"]
-OBJECT_TYPES = [ANIMAL, OTHER, PERSON, VEHICLE]
-
 
 CONF_TARGET = "target"
 CONF_TARGETS = "targets"
@@ -90,7 +84,7 @@ DEFAULT_ROI_Y_MIN = 0.0
 DEFAULT_ROI_Y_MAX = 1.0
 DEFAULT_ROI_X_MIN = 0.0
 DEFAULT_ROI_X_MAX = 1.0
-DEAULT_SCALE = 1.0
+DEFAULT_SCALE = 1.0
 DEFAULT_ROI = (
     DEFAULT_ROI_Y_MIN,
     DEFAULT_ROI_X_MIN,
@@ -99,18 +93,13 @@ DEFAULT_ROI = (
 )
 
 EVENT_OBJECT_DETECTED = "codeproject_ai.object_detected"
-BOX = "box"
-FILE = "file"
-OBJECT = "object"
 SAVED_FILE = "saved_file"
 MIN_CONFIDENCE = 0.1
 JPG = "jpg"
 PNG = "png"
 
-# rgb(red, green, blue)
-RED = (255, 0, 0)  # For objects within the ROI
-GREEN = (0, 255, 0)  # For ROI box
-YELLOW = (255, 255, 0)  # Unused
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
 
 TARGETS_SCHEMA = {
     vol.Required(CONF_TARGET): cv.string,
@@ -119,12 +108,10 @@ TARGETS_SCHEMA = {
     ),
 }
 
-
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_IP_ADDRESS): cv.string,
         vol.Required(CONF_PORT): cv.port,
-        # vol.Optional(CONF_API_KEY, default=DEFAULT_API_KEY): cv.string,
         vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
         vol.Optional(CONF_CUSTOM_MODEL, default=""): cv.string,
         vol.Optional(CONF_TARGETS, default=DEFAULT_TARGETS): vol.All(
@@ -134,10 +121,10 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_ROI_X_MIN, default=DEFAULT_ROI_X_MIN): cv.small_float,
         vol.Optional(CONF_ROI_Y_MAX, default=DEFAULT_ROI_Y_MAX): cv.small_float,
         vol.Optional(CONF_ROI_X_MAX, default=DEFAULT_ROI_X_MAX): cv.small_float,
-        vol.Optional(CONF_SCALE, default=DEAULT_SCALE): vol.All(
-            vol.Coerce(float, vol.Range(min=0.1, max=1))
+        vol.Optional(CONF_SCALE, default=DEFAULT_SCALE): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1, max=1.0)
         ),
-        vol.Optional(CONF_SAVE_FILE_FOLDER): cv.isdir,
+        vol.Optional(CONF_SAVE_FILE_FOLDER): cv.string,
         vol.Optional(CONF_SAVE_FILE_FORMAT, default=JPG): vol.In([JPG, PNG]),
         vol.Optional(CONF_SAVE_TIMESTAMPTED_FILE, default=False): cv.boolean,
         vol.Optional(CONF_ALWAYS_SAVE_LATEST_FILE, default=False): cv.boolean,
@@ -150,48 +137,55 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
-# rgb(red, green, blue)
-RED = (255, 0, 0)  # For objects within the ROI - tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-GREEN = (0, 255, 0)  # For ROI box
-YELLOW = (255, 255, 0)  # Unused
-
 Box = namedtuple("Box", "y_min x_min y_max x_max")
 Point = namedtuple("Point", "y x")
 
 
 def point_in_box(box: Box, point: Point) -> bool:
-    """Return true if point lies in box"""
-    if (box.x_min <= point.x <= box.x_max) and (box.y_min <= point.y <= box.y_max):
-        return True
-    return False
+    """Return True if point lies in box."""
+    return (box.x_min <= point.x <= box.x_max) and (box.y_min <= point.y <= box.y_max)
 
 
-def object_in_roi(roi: dict, centroid: dict) -> bool:
-    """Convenience to convert dicts to the Point and Box."""
+def object_in_roi(roi: dict[str, float], centroid: dict[str, float]) -> bool:
+    """Convenience to convert dicts to Point and Box."""
     target_center_point = Point(centroid["y"], centroid["x"])
     roi_box = Box(roi["y_min"], roi["x_min"], roi["y_max"], roi["x_max"])
     return point_in_box(roi_box, target_center_point)
 
 
 def get_valid_filename(name: str) -> str:
+    """Return a filesystem-safe filename stem."""
     return re.sub(r"(?u)[^-\w.]", "", str(name).strip().replace(" ", "_"))
 
 
 def get_object_type(object_name: str) -> str:
+    """Return normalized object type."""
     if object_name == PERSON:
         return PERSON
-    elif object_name in ANIMALS:
+    if object_name in ANIMALS:
         return ANIMAL
-    elif object_name in VEHICLES:
+    if object_name in VEHICLES:
         return VEHICLE
-    else:
-        return OTHER
+    return OTHER
 
 
-def get_objects(predictions: list, img_width: int, img_height: int) -> List[Dict]:
+def hex_to_rgb(value: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Convert #RRGGBB to RGB tuple."""
+    try:
+        cleaned = value.lstrip("#")
+        if len(cleaned) != 6:
+            raise ValueError("Invalid RGB hex length")
+        return tuple(int(cleaned[i : i + 2], 16) for i in (0, 2, 4))
+    except (ValueError, TypeError):
+        _LOGGER.warning("Invalid color '%s', falling back to %s", value, default)
+        return default
+
+
+def get_objects(predictions: list[dict[str, Any]], img_width: int, img_height: int) -> list[dict[str, Any]]:
     """Return objects with formatting and extra info."""
-    objects = []
+    objects: list[dict[str, Any]] = []
     decimal_places = 3
+
     for pred in predictions:
         box_width = pred["x_max"] - pred["x_min"]
         box_height = pred["y_max"] - pred["y_min"]
@@ -222,83 +216,112 @@ def get_objects(predictions: list, img_width: int, img_height: int) -> List[Dict
                 "confidence": confidence,
             }
         )
+
     return objects
 
 
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    """Set up the classifier."""
+def _build_entities(config: ConfigType) -> list["ObjectClassifyEntity"]:
+    """Build entities from config."""
     save_file_folder = config.get(CONF_SAVE_FILE_FOLDER)
-    use_subfolders=config.get(CONF_USE_SUBFOLDERS),
-    if save_file_folder:
-        save_file_folder = Path(save_file_folder)
+    use_subfolders = config.get(CONF_USE_SUBFOLDERS, False)
 
-    entities = []
+    base_save_path = Path(save_file_folder) if save_file_folder else None
+    entities: list[ObjectClassifyEntity] = []
+
     for camera in config[CONF_SOURCE]:
-        if save_file_folder and use_subfolders==True:
-            camera_save_file_folder = Path(config.get(CONF_SAVE_FILE_FOLDER) / split_entity_id(camera.get(CONF_ENTITY_ID))[1])
+        camera_entity_id = camera[CONF_ENTITY_ID]
+        camera_name = camera.get(CONF_NAME) or camera_entity_id.split(".", 1)[1]
+
+        if base_save_path and use_subfolders:
+            camera_save_file_folder = base_save_path / camera_entity_id.split(".", 1)[1]
         else:
-            camera_save_file_folder = save_file_folder
-            
-        object_entity = ObjectClassifyEntity(
-            ip_address=config.get(CONF_IP_ADDRESS),
-            port=config.get(CONF_PORT),
-            timeout=config.get(CONF_TIMEOUT),
-            custom_model=config.get(CONF_CUSTOM_MODEL),
-            targets=config.get(CONF_TARGETS),
-            confidence=config.get(CONF_CONFIDENCE),
-            roi_y_min=config[CONF_ROI_Y_MIN],
-            roi_x_min=config[CONF_ROI_X_MIN],
-            roi_y_max=config[CONF_ROI_Y_MAX],
-            roi_x_max=config[CONF_ROI_X_MAX],
-            scale=config[CONF_SCALE],
-            show_boxes=config[CONF_SHOW_BOXES],
-            save_file_folder=camera_save_file_folder,
-            save_file_format=config[CONF_SAVE_FILE_FORMAT],
-            save_timestamped_file=config.get(CONF_SAVE_TIMESTAMPTED_FILE),
-            always_save_latest_file=config.get(CONF_ALWAYS_SAVE_LATEST_FILE),
-            filename_prefix=config.get(CONF_FILENAME_PREFIX),
-            object_box_colour=config.get(CONF_OBJECT_BOX_COLOUR),
-            roi_box_colour=config.get(CONF_ROI_BOX_COLOUR),
-            crop_roi=config[CONF_CROP_ROI],
-            use_subfolders=use_subfolders,
-            camera_entity=camera.get(CONF_ENTITY_ID),
-            name=camera.get(CONF_NAME),
+            camera_save_file_folder = base_save_path
+
+        entities.append(
+            ObjectClassifyEntity(
+                ip_address=config[CONF_IP_ADDRESS],
+                port=config[CONF_PORT],
+                timeout=config[CONF_TIMEOUT],
+                custom_model=config[CONF_CUSTOM_MODEL],
+                targets=config[CONF_TARGETS],
+                confidence=config.get(CONF_CONFIDENCE, DEFAULT_CONFIDENCE),
+                roi_y_min=config[CONF_ROI_Y_MIN],
+                roi_x_min=config[CONF_ROI_X_MIN],
+                roi_y_max=config[CONF_ROI_Y_MAX],
+                roi_x_max=config[CONF_ROI_X_MAX],
+                scale=config[CONF_SCALE],
+                show_boxes=config[CONF_SHOW_BOXES],
+                save_file_folder=camera_save_file_folder,
+                save_file_format=config[CONF_SAVE_FILE_FORMAT],
+                save_timestamped_file=config[CONF_SAVE_TIMESTAMPTED_FILE],
+                always_save_latest_file=config[CONF_ALWAYS_SAVE_LATEST_FILE],
+                use_subfolders=use_subfolders,
+                filename_prefix=config[CONF_FILENAME_PREFIX],
+                object_box_colour=config[CONF_OBJECT_BOX_COLOUR],
+                roi_box_colour=config[CONF_ROI_BOX_COLOUR],
+                crop_roi=config[CONF_CROP_ROI],
+                camera_entity=camera[CONF_ENTITY_ID],
+                name=camera_name,
+            )
         )
-        entities.append(object_entity)
-    add_devices(entities)
+
+    return entities
+
+
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    """Set up the platform."""
+    add_entities(_build_entities(config))
+
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    """Set up the platform."""
+    async_add_entities(_build_entities(config))
 
 
 class ObjectClassifyEntity(ImageProcessingEntity):
-    """Perform a object classification."""
+    """Perform object classification via CodeProject.AI."""
+
+    _attr_should_poll = False
 
     def __init__(
         self,
-        ip_address,
-        port,
-        timeout,
-        custom_model,
-        targets,
-        confidence,
-        roi_y_min,
-        roi_x_min,
-        roi_y_max,
-        roi_x_max,
-        scale,
-        show_boxes,
-        save_file_folder,
-        save_file_format,
-        save_timestamped_file,
-        always_save_latest_file,
-        use_subfolders,
-        filename_prefix,
-        object_box_colour,
-        roi_box_colour,
-        crop_roi,
-        camera_entity,
-        name=None,
-    ):
-        """Init with the API key and model id."""
+        ip_address: str,
+        port: int,
+        timeout: int,
+        custom_model: str,
+        targets: list[dict[str, Any]],
+        confidence: float,
+        roi_y_min: float,
+        roi_x_min: float,
+        roi_y_max: float,
+        roi_x_max: float,
+        scale: float,
+        show_boxes: bool,
+        save_file_folder: Path | None,
+        save_file_format: str,
+        save_timestamped_file: bool,
+        always_save_latest_file: bool,
+        use_subfolders: bool,
+        filename_prefix: str,
+        object_box_colour: str,
+        roi_box_colour: str,
+        crop_roi: bool,
+        camera_entity: str,
+        name: str | None = None,
+    ) -> None:
+        """Initialize the entity."""
         super().__init__()
+
         self._cpai_object = cpai.CodeProjectAIObject(
             ip=ip_address,
             port=port,
@@ -306,32 +329,30 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             min_confidence=MIN_CONFIDENCE,
             custom_model=custom_model,
         )
+
+        self.timeout = timeout
+        self._attr_camera_entity = camera_entity
+        self._attr_confidence = confidence
+
         self._custom_model = custom_model
-        self._confidence = confidence
-        self._summary = {}
-        self._targets = targets
+        self._targets = [dict(target) for target in targets]
         for target in self._targets:
-            if CONF_CONFIDENCE not in target.keys():
-                target.update({CONF_CONFIDENCE: self._confidence})
-        self._targets_names = [
-            target[CONF_TARGET] for target in targets
-        ]  # can be a name or a type
-        self._object_box_colour = tuple(int(object_box_colour.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-        self._roi_box_colour = tuple(int(roi_box_colour.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-        self._filename_prefix = filename_prefix if filename_prefix is not None else ''
+            if CONF_CONFIDENCE not in target:
+                target[CONF_CONFIDENCE] = confidence
 
-        self._camera = camera_entity
-        self._camera_name = split_entity_id(camera_entity)[1]
-        if name:
-            self._name = name
-        else:
-            camera_name = split_entity_id(camera_entity)[1]
-            self._name = f"{self._filename_prefix}{camera_name}{datetime.today().strftime('%Y%m%d%H%M%S')}"
+        self._targets_names = [target[CONF_TARGET] for target in self._targets]
+        self._object_box_colour = hex_to_rgb(object_box_colour, RED)
+        self._roi_box_colour = hex_to_rgb(roi_box_colour, GREEN)
+        self._filename_prefix = filename_prefix or ""
 
-        self._state = None
-        self._objects = []  # The parsed raw data
-        self._targets_found = []
-        self._last_detection = None
+        self._camera_name = camera_entity.split(".", 1)[1]
+        self._attr_name = name or f"{self._filename_prefix}{self._camera_name}"
+
+        self._state: int = 0
+        self._objects: list[dict[str, Any]] = []
+        self._targets_found: list[dict[str, Any]] = []
+        self._summary: dict[str, int] = {}
+        self._last_detection: str | None = None
 
         self._roi_dict = {
             "y_min": roi_y_min,
@@ -342,151 +363,44 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         self._crop_roi = crop_roi
         self._scale = scale
         self._show_boxes = show_boxes
-        self._image_width = None
-        self._image_height = None
+        self._image_width: int | None = None
+        self._image_height: int | None = None
         self._save_file_folder = save_file_folder
         self._save_file_format = save_file_format
         self._always_save_latest_file = always_save_latest_file
         self._save_timestamped_file = save_timestamped_file
         self._use_subfolders = use_subfolders
-        self._image = None
-
-    def process_image(self, image):
-        """Process an image."""
-        self._image = Image.open(io.BytesIO(bytearray(image)))
-        self._image_width, self._image_height = self._image.size
-        # scale to roi
-        if self._crop_roi:
-            roi = (
-                self._image_width * self._roi_dict["x_min"],
-                self._image_height * self._roi_dict["y_min"],
-                self._image_width * (self._roi_dict["x_max"]),
-                self._image_height * (self._roi_dict["y_max"])
-            )
-            self._image = self._image.crop(roi)
-            self._image_width, self._image_height = self._image.size
-            with io.BytesIO() as output:
-                self._image.save(output, format="JPEG")
-                image = output.getvalue()
-            _LOGGER.debug(
-                (
-                    f"Image cropped with : {self._roi_dict} W={self._image_width} H={self._image_height}"
-                )
-            )
-        # resize image if different then default
-        if self._scale != DEAULT_SCALE:
-            newsize = (self._image_width * self._scale, self._image_width * self._scale)
-            self._image.thumbnail(newsize, Image.LANCZOS)
-            self._image_width, self._image_height = self._image.size
-            with io.BytesIO() as output:
-                self._image.save(output, format="JPEG")
-                image = output.getvalue()
-            _LOGGER.debug(
-                (
-                    f"Image scaled with : {self._scale} W={self._image_width} H={self._image_height}"
-                )
-            )
-
-        self._state = None
-        self._objects = []  # The parsed raw data
-        self._targets_found = []
-        self._summary = {}
-        saved_image_path = None
-
-        try:
-            predictions = self._cpai_object.detect(image)
-        except cpai.CodeProjectAIServerException as exc:
-            _LOGGER.error("CodeProject.AI Server error : %s", exc)
-            return
-
-        self._objects = get_objects(predictions, self._image_width, self._image_height)
-        self._targets_found = []
-
-        for obj in self._objects:
-            if not (
-                (obj["name"] in self._targets_names)
-                or (obj["object_type"] in self._targets_names)
-            ):
-                continue
-            ## Then check if the type has a configured confidence, if yes assign
-            ## Then if a confidence for a named object, this takes precedence over type confidence
-            confidence = None
-            for target in self._targets:
-                if obj["object_type"] == target[CONF_TARGET]:
-                    confidence = target[CONF_CONFIDENCE]
-            for target in self._targets:
-                if obj["name"] == target[CONF_TARGET]:
-                    confidence = target[CONF_CONFIDENCE]
-            if obj["confidence"] > confidence:
-                if not self._crop_roi and not object_in_roi(self._roi_dict, obj["centroid"]):
-                    continue
-                self._targets_found.append(obj)
-
-        self._state = len(self._targets_found)
-        if self._state > 0:
-            self._last_detection = dt_util.now().strftime(DATETIME_FORMAT)
-
-        targets_found = [
-            obj["name"] for obj in self._targets_found
-        ]  # Just the list of target names, e.g. [car, car, person]
-        self._summary = dict(Counter(targets_found))  # e.g. {'car':2, 'person':1}
-
-        if self._save_file_folder:
-            if self._state > 0 or self._always_save_latest_file:
-                saved_image_path = self.save_image(
-                    self._targets_found,
-                    self._save_file_folder,
-                )
-
-        # Fire events
-        for target in self._targets_found:
-            target_event_data = target.copy()
-            target_event_data[ATTR_ENTITY_ID] = self.entity_id
-            if saved_image_path:
-                target_event_data[SAVED_FILE] = saved_image_path
-            self.hass.bus.async_fire(EVENT_OBJECT_DETECTED, target_event_data)
+        self._image: Image.Image | None = None
 
     @property
-    def camera_entity(self):
-        """Return camera entity id from process pictures."""
-        return self._camera
-
-    @property
-    def state(self):
+    def state(self) -> int:
         """Return the state of the entity."""
         return self._state
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement."""
+    def unit_of_measurement(self) -> str:
+        """Return unit of measurement."""
         return "targets"
 
     @property
-    def should_poll(self):
-        """Return the polling state."""
-        return False
-
-    @property
-    def extra_state_attributes(self) -> Dict:
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return device specific state attributes."""
-        attr = {}
+        attr: dict[str, Any] = {}
         attr["targets"] = self._targets
         attr["targets_found"] = [
             {obj["name"]: obj["confidence"]} for obj in self._targets_found
         ]
         attr["summary"] = self._summary
-        if self._last_detection:
-            attr["last_target_detection"] = self._last_detection
-        if self._custom_model:
-            attr["custom_model"] = self._custom_model
         attr["all_objects"] = [
             {obj["name"]: obj["confidence"]} for obj in self._objects
         ]
+
+        if self._last_detection:
+            attr["last_target_detection"] = self._last_detection
+
+        if self._custom_model:
+            attr["custom_model"] = self._custom_model
+
         if self._save_file_folder:
             attr[CONF_SAVE_FILE_FOLDER] = str(self._save_file_folder)
             attr[CONF_SAVE_FILE_FORMAT] = self._save_file_format
@@ -494,18 +408,110 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             attr[CONF_ALWAYS_SAVE_LATEST_FILE] = self._always_save_latest_file
             attr[CONF_USE_SUBFOLDERS] = self._use_subfolders
             attr[CONF_FILENAME_PREFIX] = self._filename_prefix
+
         return attr
 
-    def save_image(self, targets, directory) -> str:
-        """Draws the actual bounding box of the detected objects.
+    def process_image(self, image: bytes) -> None:
+        """Process an image."""
+        self._state = 0
+        self._objects = []
+        self._targets_found = []
+        self._summary = {}
 
-        Returns: saved_image_path, which is the path to the saved timestamped file if configured, else the default saved image.
-        """
+        try:
+            self._image = Image.open(io.BytesIO(bytearray(image)))
+        except UnidentifiedImageError:
+            _LOGGER.warning("Unable to open image from camera")
+            return
+
+        self._image_width, self._image_height = self._image.size
+
+        if self._crop_roi:
+            roi = (
+                self._image_width * self._roi_dict["x_min"],
+                self._image_height * self._roi_dict["y_min"],
+                self._image_width * self._roi_dict["x_max"],
+                self._image_height * self._roi_dict["y_max"],
+            )
+            self._image = self._image.crop(roi)
+            self._image_width, self._image_height = self._image.size
+            with io.BytesIO() as output:
+                self._image.save(output, format="JPEG")
+                image = output.getvalue()
+
+        if self._scale != DEFAULT_SCALE:
+            newsize = (
+                int(self._image_width * self._scale),
+                int(self._image_height * self._scale),
+            )
+            self._image.thumbnail(newsize, Image.LANCZOS)
+            self._image_width, self._image_height = self._image.size
+            with io.BytesIO() as output:
+                self._image.save(output, format="JPEG")
+                image = output.getvalue()
+
+        saved_image_path = None
+
+        try:
+            predictions = self._cpai_object.detect(image)
+        except cpai.CodeProjectAIServerException as exc:
+            _LOGGER.error("CodeProject.AI Server error: %s", exc)
+            return
+
+        self._objects = get_objects(predictions, self._image_width, self._image_height)
+
+        for obj in self._objects:
+            if obj["name"] not in self._targets_names and obj["object_type"] not in self._targets_names:
+                continue
+
+            required_confidence = self._attr_confidence or DEFAULT_CONFIDENCE
+
+            for target in self._targets:
+                if obj["object_type"] == target[CONF_TARGET]:
+                    required_confidence = target[CONF_CONFIDENCE]
+
+            for target in self._targets:
+                if obj["name"] == target[CONF_TARGET]:
+                    required_confidence = target[CONF_CONFIDENCE]
+
+            if obj["confidence"] >= required_confidence:
+                if not self._crop_roi and not object_in_roi(self._roi_dict, obj["centroid"]):
+                    continue
+                self._targets_found.append(obj)
+
+        self._state = len(self._targets_found)
+
+        if self._state > 0:
+            self._last_detection = dt_util.now().strftime(DATETIME_FORMAT)
+
+        targets_found = [obj["name"] for obj in self._targets_found]
+        self._summary = dict(Counter(targets_found))
+
+        if self._save_file_folder and (self._state > 0 or self._always_save_latest_file):
+            try:
+                self._save_file_folder.mkdir(parents=True, exist_ok=True)
+                saved_image_path = self.save_image(self._targets_found, self._save_file_folder)
+            except OSError as exc:
+                _LOGGER.error("Unable to save image to %s: %s", self._save_file_folder, exc)
+
+        for target in self._targets_found:
+            event_data = target.copy()
+            event_data[ATTR_ENTITY_ID] = self.entity_id
+            if saved_image_path:
+                event_data[SAVED_FILE] = saved_image_path
+            self.hass.bus.fire(EVENT_OBJECT_DETECTED, event_data)
+
+    def save_image(self, targets: list[dict[str, Any]], directory: Path) -> str | None:
+        """Draw bounding boxes and save the processed image."""
+        if self._image is None:
+            return None
+
         try:
             img = self._image.convert("RGB")
         except UnidentifiedImageError:
-            _LOGGER.warning("CodeProject.AI Server unable to process image, bad data")
-            return
+            _LOGGER.warning("CodeProject.AI unable to process image, bad data")
+            return None
+
         draw = ImageDraw.Draw(img)
 
         roi_tuple = tuple(self._roi_dict.values())
@@ -516,49 +522,46 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 img.width,
                 img.height,
                 text="ROI",
-                color=GREEN,
+                color=self._roi_box_colour,
             )
 
-        for obj in targets:
-            if not self._show_boxes:
-                break
-            name = obj["name"]
-            confidence = obj["confidence"]
-            box = obj["bounding_box"]
-            centroid = obj["centroid"]
-            box_label = f"{name}: {confidence:.1f}%"
+        if self._show_boxes:
+            for obj in targets:
+                box = obj["bounding_box"]
+                centroid = obj["centroid"]
+                box_label = f'{obj["name"]}: {obj["confidence"]:.1f}%'
 
-            draw_box(
-                draw,
-                (box["y_min"], box["x_min"], box["y_max"], box["x_max"]),
-                img.width,
-                img.height,
-                text=box_label,
-                color=RED,
-            )
+                draw_box(
+                    draw,
+                    (box["y_min"], box["x_min"], box["y_max"], box["x_max"]),
+                    img.width,
+                    img.height,
+                    text=box_label,
+                    color=self._object_box_colour,
+                )
 
-            # draw bullseye
-            draw.text(
-                (centroid["x"] * img.width, centroid["y"] * img.height),
-                text="X",
-                fill=RED,
-            )
+                draw.text(
+                    (centroid["x"] * img.width, centroid["y"] * img.height),
+                    text="X",
+                    fill=self._object_box_colour,
+                )
 
-        # Save images, returning the path of saved image as str
-        latest_save_path = (
-            directory
-            / f"{get_valid_filename(self._name).lower()}_latest.{self._save_file_format}"
+        latest_filename = (
+            f"{get_valid_filename(self._attr_name).lower()}_latest.{self._save_file_format}"
         )
+        latest_save_path = directory / latest_filename
         img.save(latest_save_path)
         _LOGGER.info("CodeProject.AI saved file %s", latest_save_path)
-        saved_image_path = latest_save_path
 
-        if self._save_timestamped_file:
-            timestamp_save_path = (
-                directory
-                / f"{self._name}_{self._last_detection}.{self._save_file_format}"
+        saved_image_path: Path = latest_save_path
+
+        if self._save_timestamped_file and self._last_detection:
+            timestamp_filename = (
+                f"{get_valid_filename(self._attr_name).lower()}_{self._last_detection}.{self._save_file_format}"
             )
+            timestamp_save_path = directory / timestamp_filename
             img.save(timestamp_save_path)
             _LOGGER.info("CodeProject.AI saved file %s", timestamp_save_path)
             saved_image_path = timestamp_save_path
+
         return str(saved_image_path)
