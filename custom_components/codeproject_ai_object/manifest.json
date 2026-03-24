@@ -1,16 +1,18 @@
 {
   "domain": "codeproject_ai_object",
-  "name": "CodeProject.AI Server object custom integration",
-  "documentation": "https://github.com/lexiismadd/CodeProject.AI-HomeAssist-ObjectDetect",
-  "version": "4.6.3",
+  "name": "CodeProject.AI Server Object",
+  "documentation": "https://github.com/sunglassguy/CodeProject.AI-HomeAssist-ObjectDetect",
+  "issue_tracker": "https://github.com/sunglassguy/CodeProject.AI-HomeAssist-ObjectDetect/issues",
+  "version": "4.6.4",
+  "integration_type": "entity",
   "requirements": [
-    "pillow",
-    "codeproject-ai-api"
+    "codeproject-ai-api==0.1"
+  ],
+  "loggers": [
+    "codeprojectai"
   ],
   "dependencies": [],
   "codeowners": [
-    "@codeproject",
-    "@NeoMod",
-    "@lexiismadd"
+    "@sunglassguy"
   ]
 }
